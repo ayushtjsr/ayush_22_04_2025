@@ -1,179 +1,87 @@
-import os
-import csv
-import uuid
-import shutil
-import zipfile
-import pandas as pd
-from datetime import datetime, timedelta
-from typing import Optional
-from fastapi import FastAPI, BackgroundTasks, HTTPException
-from fastapi.responses import FileResponse
-from sqlalchemy import create_engine, Column, String, Enum, DateTime
-from sqlalchemy.orm import declarative_base, sessionmaker
-from sqlalchemy.ext.declarative import declared_attr
-from enum import Enum as PyEnum
-import pytz
+# Store Monitoring System by Ayush
 
-# Setup paths and app
-os.makedirs("data_ayush", exist_ok=True)
-os.makedirs("reports_ayush", exist_ok=True)
-app = FastAPI(title="Ayush's Restaurant Monitoring API")
+This project is a backend system that monitors uptime and downtime for restaurant locations across the U.S. It ingests CSV data and provides API endpoints for restaurant owners to request detailed uptime/downtime reports.
 
-# Database setup
-DATABASE_URL = "sqlite:///./store-monitoring-data.db"
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+---
 
-# Enum for status class
-class ReportStatus(PyEnum):
-    RUNNING = "Running"
-    COMPLETE = "Complete"
+## Features
+- **Real-time monitoring** using periodic polls (status data).
+- **Business hour awareness** with timezone conversion.
+- **Smart interpolation** of uptime/downtime even with sparse data.
+- **Report generation API** to trigger and retrieve historical analytics.
 
-# Report status table
-class Report(Base):
-    __tablename__ = "report_status_ayush"
+---
 
-    report_id = Column(String, primary_key=True, index=True)
-    status = Column(Enum(ReportStatus), default=ReportStatus.RUNNING)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    completed_at = Column(DateTime, nullable=True)
-    report_path = Column(String, nullable=True)
+## Data Sources
+1. `store_status.csv`: Poll data containing `store_id`, `timestamp_utc`, and `status` (active/inactive).
+2. `business_hours.csv`: Operating hours in local time.
+3. `store_timezones.csv`: Timezone information per store.
 
-Base.metadata.create_all(bind=engine)
+---
 
-# Helper function to extract data
-@app.on_event("startup")
-def load_data():
-    zip_path = "store-monitoring-data.zip"
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall("data_ayush")
+## Tech Stack
+- **FastAPI** - Web framework
+- **Pandas** - Data processing
+- **SQLite** - Lightweight relational database
+- **SQLAlchemy** - ORM
 
-# Improved interpolation logic
+---
 
-def calculate_uptime_downtime(status_df, business_hours_df, tz_df, now):
-    report_data = []
-    status_df['timestamp_utc'] = pd.to_datetime(status_df['timestamp_utc'])
+## Setup Instructions
+```bash
+git clone https://github.com/ayushtjsr/ayush_22-04-2025.git
+cd store-monitoring-system
 
-    for store_id, store_status in status_df.groupby("store_id"):
-        store_timezone = tz_df[tz_df['store_id'] == store_id]['timezone_str'].values
-        tz_str = store_timezone[0] if len(store_timezone) > 0 else 'America/Chicago'
-        tz = pytz.timezone(tz_str)
+# Build and run
 
-        business_hours = business_hours_df[business_hours_df['store_id'] == store_id]
 
-        def get_intervals(period_hours):
-            interval_start = now - timedelta(hours=period_hours)
-            intervals = []
-            current = interval_start
-            while current < now:
-                local_time = current.astimezone(tz)
-                day = local_time.weekday()
-                hours = business_hours[business_hours['dayOfWeek'] == day]
-                if hours.empty:
-                    intervals.append((current, min(current + timedelta(hours=1), now)))
-                else:
-                    for _, row in hours.iterrows():
-                        start = tz.localize(datetime.combine(local_time.date(), pd.to_datetime(row['start_time_local']).time())).astimezone(pytz.utc)
-                        end = tz.localize(datetime.combine(local_time.date(), pd.to_datetime(row['end_time_local']).time())).astimezone(pytz.utc)
-                        if start < now and end > interval_start:
-                            intervals.append((max(start, interval_start), min(end, now)))
-                current += timedelta(days=1)
-            return intervals
+# App runs at http://localhost:3000
+```
 
-        def interpolate(intervals):
-            total_uptime = total_downtime = 0
-            for start, end in intervals:
-                subset = store_status[(store_status['timestamp_utc'] >= start) & (store_status['timestamp_utc'] <= end)]
-                if subset.empty:
-                    continue
-                sorted_subset = subset.sort_values('timestamp_utc')
-                last_time = start
-                for i, row in sorted_subset.iterrows():
-                    duration = (row['timestamp_utc'] - last_time).total_seconds() / 60
-                    if row['status'] == 'active':
-                        total_uptime += duration
-                    else:
-                        total_downtime += duration
-                    last_time = row['timestamp_utc']
-                final_duration = (end - last_time).total_seconds() / 60
-                if sorted_subset.iloc[-1]['status'] == 'active':
-                    total_uptime += final_duration
-                else:
-                    total_downtime += final_duration
-            return total_uptime, total_downtime
+---
 
-        intervals_1h = get_intervals(1)
-        intervals_24h = get_intervals(24)
-        intervals_7d = get_intervals(24 * 7)
+## API Endpoints
+### `POST /trigger_report`
+Triggers report generation.
+Returns:
+```json
+{ "report_id": "some-uuid" }
+```
 
-        uptime_1h, downtime_1h = interpolate(intervals_1h)
-        uptime_24h, downtime_24h = interpolate(intervals_24h)
-        uptime_7d, downtime_7d = interpolate(intervals_7d)
+### `GET /get_report?report_id=...`
+Fetch report status or CSV file.
+Returns:
+```json
+{ "status": "Running" }
+```
+Or downloadable CSV if complete.
 
-        report_data.append({
-            "store_id": store_id,
-            "uptime_last_hour": round(uptime_1h, 2),
-            "uptime_last_day": round(uptime_24h / 60, 2),
-            "update_last_week": round(uptime_7d / 60, 2),
-            "downtime_last_hour": round(downtime_1h, 2),
-            "downtime_last_day": round(downtime_24h / 60, 2),
-            "downtime_last_week": round(downtime_7d / 60, 2),
-        })
-    return report_data
+---
 
-# Report generation logic
+## Smart Interpolation
+If a store is open 9AM–12PM and we have logs only at 10:15AM (active) and 11:15AM (inactive), we interpolate for the full business interval to estimate uptime/downtime.
 
-def generate_report(report_id: str):
-    session = SessionLocal()
-    try:
-        status_df = pd.read_csv("store-monitoring-data/store_status.csv")
-        hours_df = pd.read_csv("store-monitoring-data/menu_hours.csv")
-        tz_df = pd.read_csv("store-monitoring-data/timezones.csv")
+---
 
-        status_df['timestamp_utc'] = pd.to_datetime(status_df['timestamp_utc'])
-        now = status_df['timestamp_utc'].max()
+## Sample Report Output
+| store_id | uptime_last_hour | uptime_last_day | update_last_week | downtime_last_hour | downtime_last_day | downtime_last_week |
+|----------|------------------|------------------|-------------------|---------------------|--------------------|---------------------|
+| 111      | 45.0             | 22.3             | 120.5             | 15.0                | 1.7                | 47.5                |
 
-        report_data = calculate_uptime_downtime(status_df, hours_df, tz_df, now)
+---
 
-        output_path = f"reports_ayush/{report_id}.csv"
-        keys = report_data[0].keys()
-        with open(output_path, "w", newline="") as f:
-            dict_writer = csv.DictWriter(f, keys)
-            dict_writer.writeheader()
-            dict_writer.writerows(report_data)
+## Ideas for Improvement
+- [ ] WebSocket updates for real-time report progress.
+- [ ] Data ingestion scheduler for automatic hourly ingestion.
+- [ ] Admin dashboard to visualize reports.
 
-        report = session.query(Report).filter_by(report_id=report_id).first()
-        report.status = ReportStatus.COMPLETE
-        report.completed_at = datetime.utcnow()
-        report.report_path = output_path
-        session.commit()
-    finally:
-        session.close()
 
-@app.post("/trigger_report")
-def trigger_report(background_tasks: BackgroundTasks):
-    report_id = str(uuid.uuid4())
-    session = SessionLocal()
-    try:
-        new_report = Report(report_id=report_id, status=ReportStatus.RUNNING)
-        session.add(new_report)
-        session.commit()
-    finally:
-        session.close()
+---
 
-    background_tasks.add_task(generate_report, report_id)
-    return {"report_id": report_id}
+## Author
+**Ayush** — backend developer with a passion for clean APIs and observability systems.
 
-@app.get("/get_report")
-def get_report(report_id: str):
-    session = SessionLocal()
-    try:
-        report = session.query(Report).filter_by(report_id=report_id).first()
-        if not report:
-            raise HTTPException(status_code=404, detail="Report not found")
-        if report.status == ReportStatus.RUNNING:
-            return {"status": "Running"}
-        return FileResponse(path=report.report_path, filename=f"{report_id}.csv", media_type='text/csv')
-    finally:
-        session.close()
+---
+
+
+
